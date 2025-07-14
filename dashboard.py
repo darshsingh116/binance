@@ -580,26 +580,73 @@ if coins:  # Only show if we have data
             
             if coin['sl_orders']:
                 st.markdown("**🛑 STOP LOSS ORDERS:**")
+                current_price = coin['mark_price']
+                side = coin['position_side']
+                
                 for sl in coin['sl_orders']:
                     # Skip conflicting orders in main display (they're shown in warning above)
                     if sl in conflicting_orders:
                         continue
-                        
+                    
+                    # Calculate distance percentage from current price
+                    stop_price = sl['stopPrice']
+                    if side == 'LONG':
+                        # For LONG positions, SL is below current price
+                        distance_percent = ((current_price - stop_price) / current_price) * 100
+                    else:
+                        # For SHORT positions, SL is above current price
+                        distance_percent = ((stop_price - current_price) / current_price) * 100
+                    
                     # Handle different display for losses vs profits/break-even
                     if 'trail_percent' in sl:
                         # Trailing stop loss
                         if 'ACTIVE' in sl['type']:
                             if sl.get('profit', 0) > 0:
-                                st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%) → **+${sl['profit']:.2f} Profit** 🎯")
+                                st.write(f"""
+                                <div style='margin-left: 20px; font-family: monospace;'>
+                                    • {sl['type']} @ <span style='color: #1f77b4; font-weight: bold;'>${sl['stopPrice']:.4f}</span> 
+                                    | Trail: <span style='color: #ff7f0e; font-weight: bold;'>{sl['trail_percent']:.2f}%</span> 
+                                    | Distance: <span style='color: #2ca02c; font-weight: bold;'>{distance_percent:.2f}%</span> 
+                                    → <span style='color: #2ca02c; font-weight: bold;'>+${sl['profit']:.2f} Profit</span> 🎯
+                                </div>
+                                """, unsafe_allow_html=True)
                             elif sl['loss'] == 0:
-                                st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%) → **$0.00 Break-even**")
+                                st.write(f"""
+                                <div style='margin-left: 20px; font-family: monospace;'>
+                                    • {sl['type']} @ <span style='color: #1f77b4; font-weight: bold;'>${sl['stopPrice']:.4f}</span> 
+                                    | Trail: <span style='color: #ff7f0e; font-weight: bold;'>{sl['trail_percent']:.2f}%</span> 
+                                    | Distance: <span style='color: #2ca02c; font-weight: bold;'>{distance_percent:.2f}%</span> 
+                                    → <span style='color: #666; font-weight: bold;'>$0.00 Break-even</span>
+                                </div>
+                                """, unsafe_allow_html=True)
                             else:
-                                st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%) → -${sl['loss']:.2f}")
+                                st.write(f"""
+                                <div style='margin-left: 20px; font-family: monospace;'>
+                                    • {sl['type']} @ <span style='color: #1f77b4; font-weight: bold;'>${sl['stopPrice']:.4f}</span> 
+                                    | Trail: <span style='color: #ff7f0e; font-weight: bold;'>{sl['trail_percent']:.2f}%</span> 
+                                    | Distance: <span style='color: #2ca02c; font-weight: bold;'>{distance_percent:.2f}%</span> 
+                                    → <span style='color: #d62728; font-weight: bold;'>-${sl['loss']:.2f}</span>
+                                </div>
+                                """, unsafe_allow_html=True)
                         else:
-                            st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%, Activates @ ${sl.get('activate_at', 'N/A')}) → -${sl['loss']:.2f}")
+                            st.write(f"""
+                            <div style='margin-left: 20px; font-family: monospace;'>
+                                • {sl['type']} @ <span style='color: #1f77b4; font-weight: bold;'>${sl['stopPrice']:.4f}</span> 
+                                | Trail: <span style='color: #ff7f0e; font-weight: bold;'>{sl['trail_percent']:.2f}%</span> 
+                                | Distance: <span style='color: #2ca02c; font-weight: bold;'>{distance_percent:.2f}%</span> 
+                                | Activates @ <span style='color: #9467bd; font-weight: bold;'>${sl.get('activate_at', 'N/A')}</span> 
+                                → <span style='color: #d62728; font-weight: bold;'>-${sl['loss']:.2f}</span>
+                            </div>
+                            """, unsafe_allow_html=True)
                     else:
                         # Regular stop loss
-                        st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} → -${sl['loss']:.2f}")
+                        st.write(f"""
+                        <div style='margin-left: 20px; font-family: monospace;'>
+                            • {sl['type']} @ <span style='color: #1f77b4; font-weight: bold;'>${sl['stopPrice']:.4f}</span> 
+                            | Distance: <span style='color: #2ca02c; font-weight: bold;'>{distance_percent:.2f}%</span> 
+                            → <span style='color: #d62728; font-weight: bold;'>-${sl['loss']:.2f}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
                 
                 # Show which SL will trigger first (excluding conflicting orders)
                 valid_sl_orders = [sl for sl in coin['sl_orders'] if sl not in conflicting_orders]
