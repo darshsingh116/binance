@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration (change as per your setup)
-REPO_DIR="/home/ec2-user/binance-dashboard"
+REPO_DIR="/home/ec2-user/binance"
 DOCKER_IMAGE_NAME="binance-dashboard"
 DOCKER_CONTAINER_NAME="binance-ui"
 PORT=8501
