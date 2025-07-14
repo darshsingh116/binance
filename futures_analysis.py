@@ -9,33 +9,21 @@ API_KEY = os.getenv("API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY")
 
 # --- Initialize Binance Client ---
-# Handles potential time sync issues automatically
 client = Client(API_KEY, SECRET_KEY)
 
 def analyze_futures_account():
-    """
-    Fetches and provides a detailed per-coin analysis of futures positions,
-    orders, potential losses, and warnings for missing SL/TP and Trailing SL.
-    Calculates the maximum potential loss per coin based on stop-loss orders
-    (fixed or trailing), and a total net max loss.
-    """
     try:
-        # --- Fetch All Positions and Open Orders ---
         positions = client.futures_position_information()
         open_orders = client.futures_get_open_orders()
 
-        # --- Filter for actual open positions ---
         open_positions = [p for p in positions if float(p['positionAmt']) != 0]
-
         if not open_positions:
             print("No open futures positions found.")
             return
 
-        # --- Create DataFrames for easier manipulation ---
         positions_df = pd.DataFrame(open_positions)
         orders_df = pd.DataFrame(open_orders) if open_orders else pd.DataFrame()
 
-        # --- Convert relevant columns to numeric types for calculation ---
         for df in [positions_df, orders_df]:
             if df.empty: continue
             for col in ['positionAmt', 'entryPrice', 'markPrice', 'unRealizedProfit', 'origQty', 'price', 'stopPrice', 'priceRate', 'activatePrice']:
@@ -46,17 +34,14 @@ def analyze_futures_account():
 
         total_potential_profit = 0
         total_current_unrealized_pnl = 0
-        net_max_loss_from_stops = 0 # This will accumulate the worst-case loss from stops across all coins
+        net_max_loss_from_stops = 0
 
-        # --- Get unique symbols from open positions ---
         unique_symbols = positions_df['symbol'].unique()
-
         print("--- Account Risk & Profit Analysis ---\n")
 
         for symbol in unique_symbols:
             print(f"==================== {symbol} ====================")
-            
-            # --- Position Info ---
+
             position = positions_df[positions_df['symbol'] == symbol].iloc[0]
             position_amt = position['positionAmt']
             entry_price = position['entryPrice']
@@ -66,132 +51,95 @@ def analyze_futures_account():
             unrealized_profit = position['unRealizedProfit']
             total_current_unrealized_pnl += unrealized_profit
 
+            pnl_sign = '+' if unrealized_profit >= 0 else '-'
             print(f"✅ OPEN POSITION:")
             print(f"  - Side: {position_side}, Quantity: {position_amt}, Value: ${position_value_usdt:,.2f}")
             print(f"  - Entry Price: ${entry_price:,.4f}, Mark Price: ${mark_price:,.4f}")
-            print(f"  - Current Unrealized PnL: ${unrealized_profit:,.2f}\n")
+            print(f"  - Current Unrealized PnL: {pnl_sign}${abs(unrealized_profit):,.2f}\n")
 
-            # --- Find associated orders for this symbol ---
             associated_orders = orders_df[orders_df['symbol'] == symbol] if not orders_df.empty else pd.DataFrame()
-            
-            coin_max_loss = 0 # To store the max loss for this specific coin
+            coin_max_loss = 0
             covered_qty_by_fixed_sl = 0
 
-            # --- Stop Loss Analysis (Regular SL, excluding Trailing SL) ---
             sl_orders = associated_orders[
                 associated_orders['type'].isin(['STOP_MARKET', 'STOP_LOSS', 'STOP_LOSS_LIMIT']) &
                 (associated_orders['type'] != 'TRAILING_STOP_MARKET')
             ]
-            
+
             if not sl_orders.empty:
                 print(f"🛑 FIXED STOP LOSS ORDERS:")
                 for _, sl in sl_orders.iterrows():
                     if pd.notna(sl['stopPrice']):
-                        # Calculate potential loss from entry
                         loss_from_entry = abs(entry_price - sl['stopPrice']) * sl['origQty']
                         if position_side == 'LONG' and sl['stopPrice'] >= entry_price:
-                            # It's a profit if SL is above entry for LONG
-                            loss_str = f"Profit: ${loss_from_entry:,.2f}"
-                            loss_value = -loss_from_entry # Negative for profit in 'loss' context
+                            loss_value = -loss_from_entry
                         elif position_side == 'SHORT' and sl['stopPrice'] <= entry_price:
-                            # It's a profit if SL is below entry for SHORT
-                            loss_str = f"Profit: ${loss_from_entry:,.2f}"
                             loss_value = -loss_from_entry
                         else:
-                            # It's a loss
-                            loss_str = f"Loss: ${loss_from_entry:,.2f}"
                             loss_value = loss_from_entry
-                        
-                        print(f"  - Type: {sl['type']}, Quantity: {sl['origQty']}, Trigger: ${sl['stopPrice']:,.4f} -> {loss_str}")
-                        
-                        # We need to determine the single worst stop loss for overlapping quantities
-                        # For simplicity here, we'll assume non-overlapping quantities or take the sum
-                        # For calculating 'net_max_loss_from_stops', we need the *worst* stop loss for any given quantity.
-                        # A robust system would track covered quantities precisely.
-                        # For now, let's take the most impactful fixed SL for the coin's max loss.
-                        if loss_value > coin_max_loss: # If this is a bigger loss (or less profit)
-                            coin_max_loss = loss_value
-                        covered_qty_by_fixed_sl += sl['origQty'] # Track quantity covered by fixed SL
 
-            # --- Trailing Stop Loss Analysis ---
+                        sign = '+' if loss_value < 0 else '-'
+                        print(f"  - Type: {sl['type']}, Quantity: {sl['origQty']}, Trigger: ${sl['stopPrice']:,.4f} -> {sign}${abs(loss_value):,.2f}")
+
+                        if abs(loss_value) > abs(coin_max_loss):
+                            coin_max_loss = loss_value
+                        covered_qty_by_fixed_sl += sl['origQty']
+
             trailing_sl_orders = associated_orders[associated_orders['type'] == 'TRAILING_STOP_MARKET']
-            
+
             if not trailing_sl_orders.empty:
                 print(f"🟠 TRAILING STOP LOSS ORDERS:")
                 for _, tsl in trailing_sl_orders.iterrows():
                     delta_percent = tsl['priceRate']
                     activate_price = tsl['activatePrice']
-                    stop_price_from_api = tsl['stopPrice'] # The static stopPrice from API
-
-                    # Determine the effective "current" stop loss price
+                    stop_price_from_api = tsl['stopPrice']
                     effective_sl_price = None
                     loss_from_entry_at_sl = None
 
-                    # Activation condition check based on position side
                     if position_side == 'LONG':
                         activation_condition_met = pd.isna(activate_price) or mark_price >= activate_price
-                    else: # SHORT position
+                    else:
                         activation_condition_met = pd.isna(activate_price) or mark_price <= activate_price
 
-                    if not activation_condition_met: # If activatePrice is set and not yet hit
+                    if not activation_condition_met:
                         print(f"  - Type: {tsl['type']}, Quantity: {tsl['origQty']}, Trailing Delta: {delta_percent:.2f}% (Activation Price: ${activate_price:,.2f} NOT YET HIT)")
                         if pd.notna(stop_price_from_api) and stop_price_from_api != 0:
                             effective_sl_price = stop_price_from_api
                             loss_from_entry_at_sl = (entry_price - effective_sl_price) * tsl['origQty'] * (1 if position_side == 'LONG' else -1)
-                            
-                            if loss_from_entry_at_sl < 0: # It's a profit
-                                loss_str = f"Profit: ${abs(loss_from_entry_at_sl):,.2f}"
-                            else: # It's a loss
-                                loss_str = f"Loss: ${loss_from_entry_at_sl:,.2f}"
-                            
-                            print(f"    - Worst Case Trigger: ${effective_sl_price:,.4f} -> {loss_str}")
-                            
-                            # If this TSL (before activation) is the worst case for some quantity
-                            # This logic is simplified; a precise model would track covered quantities.
-                            if loss_from_entry_at_sl > coin_max_loss:
+                            sign = '+' if loss_from_entry_at_sl < 0 else '-'
+                            print(f"    - Worst Case Trigger: ${effective_sl_price:,.4f} -> {sign}${abs(loss_from_entry_at_sl):,.2f}")
+                            if abs(loss_from_entry_at_sl) > abs(coin_max_loss):
                                 coin_max_loss = loss_from_entry_at_sl
                         else:
                             print("    - No fixed stopPrice provided before activation. Risk is undefined for this portion.")
-                    else: # Trailing stop is active (either activatePrice hit, or not set)
-                        # Calculate the dynamic worst-case trigger price from the current markPrice
+                    else:
                         if position_side == 'LONG':
                             effective_sl_price = mark_price * (1 - delta_percent / 100)
-                        else: # SHORT position
+                        else:
                             effective_sl_price = mark_price * (1 + delta_percent / 100)
-                        
-                        loss_from_entry_at_sl = (entry_price - effective_sl_price) * tsl['origQty'] * (1 if position_side == 'LONG' else -1)
-                        
-                        if loss_from_entry_at_sl < 0: # It's a profit
-                            loss_str = f"Profit: ${abs(loss_from_entry_at_sl):,.2f}"
-                        else: # It's a loss
-                            loss_str = f"Loss: ${loss_from_entry_at_sl:,.2f}"
 
+                        loss_from_entry_at_sl = (entry_price - effective_sl_price) * tsl['origQty'] * (1 if position_side == 'LONG' else -1)
+                        sign = '+' if loss_from_entry_at_sl < 0 else '-'
                         print(f"  - Type: {tsl['type']}, Quantity: {tsl['origQty']}, Trailing Delta: {delta_percent:.2f}% (ACTIVE)")
-                        print(f"    - Current Worst Case Trigger: ${effective_sl_price:,.4f} -> {loss_str}")
-                        
-                        # Update coin_max_loss if this active trailing stop represents a greater potential loss
-                        if loss_from_entry_at_sl > coin_max_loss:
+                        print(f"    - Current Worst Case Trigger: ${effective_sl_price:,.4f} -> {sign}${abs(loss_from_entry_at_sl):,.2f}")
+                        if abs(loss_from_entry_at_sl) > abs(coin_max_loss):
                             coin_max_loss = loss_from_entry_at_sl
 
-            # Calculate total uncovered quantity for SL
-            # This is a basic check. A robust system would map quantities to specific stop orders.
-            total_sl_covered_qty = sl_orders['origQty'].sum() + trailing_sl_orders['origQty'].sum() 
+            total_sl_covered_qty = sl_orders['origQty'].sum() + trailing_sl_orders['origQty'].sum()
             uncovered_qty = abs(position_amt) - total_sl_covered_qty
-            
+
             if uncovered_qty > 0:
                 uncovered_value_usdt = uncovered_qty * mark_price
                 print(f"  - ⚠️ CAUTION: No Stop-Loss (fixed or active trailing) for {uncovered_qty} units (approx. ${uncovered_value_usdt:,.2f}). Risk is undefined.")
 
-            # Add the determined max loss for this coin to the total net max loss
-            net_max_loss_from_stops += max(0, coin_max_loss) # Only add to net max loss if it's an actual loss
+            net_max_loss_from_stops += max(0, coin_max_loss)
+            sign = '-' if coin_max_loss > 0 else '+'
+            print(f"  - Worst-Case PnL for {symbol} (if SL triggers): {sign}${abs(coin_max_loss):,.2f}\n")
 
-            print(f"  - Worst-Case Loss for {symbol} (if SL triggers): ${max(0, coin_max_loss):,.2f}\n") # Display max loss for current coin
-
-            # --- Take Profit Analysis (same as before) ---
             tp_orders = associated_orders[associated_orders['type'].isin(['TAKE_PROFIT_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_LIMIT'])]
             tp_quantity_covered = tp_orders['origQty'].sum()
             uncovered_tp_qty = abs(position_amt) - tp_quantity_covered
-            
+
             position_max_profit = 0
             if not tp_orders.empty:
                 for _, tp in tp_orders.iterrows():
@@ -199,12 +147,11 @@ def analyze_futures_account():
                         profit = abs(tp['stopPrice'] - entry_price) * tp['origQty']
                         position_max_profit += profit
                 total_potential_profit += position_max_profit
-                print(f"  - Max Profit (from TP): ${position_max_profit:,.2f} across {tp_quantity_covered} units.")
+                print(f"  - Max Profit (from TP): +${position_max_profit:,.2f} across {tp_quantity_covered} units.")
 
             if uncovered_tp_qty > 0:
                 print(f"  - No Take-Profit for {uncovered_tp_qty} units.\n")
 
-            # --- Unfilled Limit Order Analysis (same as before) ---
             limit_orders = associated_orders[associated_orders['type'] == 'LIMIT']
             if not limit_orders.empty:
                 print(f"🔵 UNFILLED LIMIT ORDERS:")
@@ -215,14 +162,12 @@ def analyze_futures_account():
 
             print(f"===============================================\n")
 
-
-        # --- Final Summary ---
         print("\n--- 🥅 NET ACCOUNT SUMMARY 🥅 ---")
-        print(f"Total Current Unrealized PnL:    ${total_current_unrealized_pnl:,.2f}")
-        print(f"Total Potential Profit (from all TPs): ${total_potential_profit:,.2f}")
-        print(f"Total Net Max Loss (from all SLs): ${net_max_loss_from_stops:,.2f}") # New summary line for max loss
+        sign_pnl = '+' if total_current_unrealized_pnl >= 0 else '-'
+        print(f"Total Current Unrealized PnL:    {sign_pnl}${abs(total_current_unrealized_pnl):,.2f}")
+        print(f"Total Potential Profit (from all TPs): +${total_potential_profit:,.2f}")
+        print(f"Total Net Max Loss (from all SLs): -${net_max_loss_from_stops:,.2f}")
         print("-----------------------------------")
-
 
     except Exception as e:
         print(f"\nAn error occurred: {e}")
