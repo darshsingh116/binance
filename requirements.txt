@@ -2,3 +2,6 @@ streamlit
 pandas
 python-binance
 python-dotenv
+matplotlib
+numpy
+streamlit-js-eval
