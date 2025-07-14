@@ -118,17 +118,94 @@ def fetch_account_data():
 
 
 def draw_loss_chart(sl_orders, symbol):
-    fig, ax = plt.subplots(figsize=(3.5, 2.5))
+    fig, ax = plt.subplots(figsize=(4, 3))
     if not sl_orders:
         return fig
-    labels = [f"{o['type']} @ {o['stopPrice']}" for o in sl_orders]
-    losses = [abs(o['loss']) for o in sl_orders]
-    bars = ax.bar(labels, losses, color='red')
-    for bar, val in zip(bars, losses):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"-${val:.2f}", ha='center', va='bottom', fontsize=7)
-    ax.set_ylabel("Loss (USDT)")
-    ax.set_title(f"{symbol} SL Risk", fontsize=9)
-    plt.xticks(rotation=45, ha='right', fontsize=7)
+    
+    # Filter out regular stop losses if there's an active trailing stop
+    has_active_trailing = any('trail_percent' in o and 'ACTIVE' in o['type'] for o in sl_orders)
+    filtered_orders = []
+    
+    for o in sl_orders:
+        if 'trail_percent' in o:
+            # Always show trailing stops
+            filtered_orders.append(o)
+        else:
+            # Only show regular stops if no active trailing stop
+            if not has_active_trailing:
+                filtered_orders.append(o)
+            # If there's an active trailing stop, mark regular stop as conflicting
+            else:
+                o['conflicting'] = True
+                filtered_orders.append(o)
+    
+    labels = []
+    values = []  # Can be losses (positive) or profits (negative)
+    colors = []
+    
+    for o in filtered_orders:
+        if o.get('conflicting'):
+            # Mark conflicting orders with cross-off
+            labels.append(f"❌ {o['type'][:4]}\n@ {o['stopPrice']:.4f}")
+            colors.append('lightgray')
+            values.append(0)  # Don't show value for conflicting
+        elif 'trail_percent' in o:
+            # Trailing stop
+            if 'ACTIVE' in o['type']:
+                if o['profit'] > 0:  # Profit
+                    labels.append(f"TSL {o['trail_percent']:.1f}%\n@ {o['stopPrice']:.4f}")
+                    colors.append('grey')
+                    values.append(-o['profit'])  # Negative for profit display
+                elif o['loss'] == 0:  # Break-even
+                    labels.append(f"TSL {o['trail_percent']:.1f}%\n@ {o['stopPrice']:.4f}")
+                    colors.append('grey')
+                    values.append(0)
+                else:
+                    labels.append(f"TSL {o['trail_percent']:.1f}%\n@ {o['stopPrice']:.4f}")
+                    colors.append('orange')
+                    values.append(o['loss'])
+            else:
+                labels.append(f"TSL {o['trail_percent']:.1f}%\n(Inactive)")
+                colors.append('lightcoral')
+                values.append(o['loss'])
+        else:
+            # Regular stop (only if no conflicting)
+            labels.append(f"{o['type'][:4]}\n@ {o['stopPrice']:.4f}")
+            colors.append('red')
+            values.append(o['loss'])
+    
+    bars = ax.bar(labels, values, color=colors)
+    
+    for bar, val, order in zip(bars, values, filtered_orders):
+        if order.get('conflicting'):
+            # Position CANCEL text to the right of the bar instead of above
+            ax.text(bar.get_x() + bar.get_width() + 0.05, 0, 
+                    "CANCEL", ha='left', va='center', fontsize=7, fontweight='bold', color='red')
+        elif val > 0:
+            # Loss - position to the right of bar
+            ax.text(bar.get_x() + bar.get_width() + 0.05, bar.get_height() / 2, 
+                    f"-${val:.2f}", ha='left', va='center', fontsize=8, fontweight='bold')
+        elif val == 0:
+            # Break-even - position to the right of bar
+            ax.text(bar.get_x() + bar.get_width() + 0.05, 0, 
+                    "$0.00", ha='left', va='center', fontsize=7, fontweight='bold', color='grey')
+        else:
+            # Profit - position to the right of bar
+            ax.text(bar.get_x() + bar.get_width() + 0.05, bar.get_height() / 2, 
+                    f"+${abs(val):.2f}", ha='left', va='center', fontsize=8, fontweight='bold', color='green')
+    
+    ax.set_ylabel("Loss/Profit (USDT)")
+    ax.set_title(f"{symbol} SL Risk Analysis", fontsize=10, fontweight='bold')
+    
+    # Set y-axis limits to reduce white space
+    if values:
+        y_min = min(values) if min(values) < 0 else 0
+        y_max = max(values) if max(values) > 0 else 0
+        # Add small padding
+        padding = max(abs(y_min), abs(y_max)) * 0.1 if (y_min != 0 or y_max != 0) else 10
+        ax.set_ylim(y_min - padding, y_max + padding)
+    
+    plt.xticks(rotation=45, ha='right', fontsize=8)
     plt.tight_layout()
     return fig
 
@@ -136,24 +213,111 @@ def draw_loss_chart(sl_orders, symbol):
 def draw_total_pnl_chart(per_coin_data):
     symbols = [coin['symbol'] for coin in per_coin_data]
     pnls = [coin['unrealized_pnl'] for coin in per_coin_data]
-    max_losses = [-abs(coin['max_loss']) for coin in per_coin_data]  # Negative for below x-axis
+    
+    # Calculate dynamic max losses (considering which SL will trigger first)
+    max_losses = []
+    profit_values = []  # Track profit values separately
+    
+    for coin in per_coin_data:
+        if coin['sl_orders']:
+            # Find the SL that will trigger first (closest to current price)
+            current_price = coin['mark_price']
+            side = coin['position_side']
+            
+            closest_sl = None
+            closest_distance = float('inf')
+            
+            # Filter out conflicting orders
+            has_active_trailing = any('trail_percent' in sl and 'ACTIVE' in sl['type'] for sl in coin['sl_orders'])
+            valid_orders = []
+            for sl in coin['sl_orders']:
+                if 'trail_percent' in sl:
+                    valid_orders.append(sl)  # Always include trailing stops
+                elif not has_active_trailing:
+                    valid_orders.append(sl)  # Only include regular stops if no active trailing
+            
+            for sl in valid_orders:
+                # Calculate distance considering direction
+                if side == 'LONG':
+                    # For LONG positions, SL triggers when price goes down
+                    if sl['stopPrice'] < current_price:
+                        distance = current_price - sl['stopPrice']
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_sl = sl
+                else:
+                    # For SHORT positions, SL triggers when price goes up
+                    if sl['stopPrice'] > current_price:
+                        distance = sl['stopPrice'] - current_price
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_sl = sl
+            
+            # Use the loss/profit from the closest SL
+            if closest_sl:
+                if closest_sl.get('profit', 0) > 0:
+                    max_losses.append(0)  # No loss if profitable
+                    profit_values.append(closest_sl['profit'])
+                else:
+                    max_loss = closest_sl['loss']
+                    max_losses.append(-max_loss)  # Negative for below x-axis
+                    profit_values.append(0)
+            else:
+                # Fallback to worst case loss
+                max_loss = coin['max_loss'] if coin['max_loss'] > 0 else 0
+                max_losses.append(-max_loss)
+                profit_values.append(0)
+        else:
+            max_losses.append(0)
+            profit_values.append(0)
 
     fig, ax = plt.subplots(figsize=(6, 2.5))
     x = range(len(symbols))
-    ax.bar(x, max_losses, width=0.4, color='lightgrey', label='Max SL Loss')  # Now negative
-    bars = ax.bar(x, pnls, width=0.3, color='green', label='Unrealized PnL')
+    
+    # Plot max losses (red/grey bars below zero)
+    loss_colors = ['lightgrey' if loss < 0 else 'white' for loss in max_losses]
+    ax.bar(x, max_losses, width=0.4, color=loss_colors, label='Max SL Loss (Next to Trigger)', alpha=0.7)
+    
+    # Plot profit values (green bars above zero)
+    profit_bars = ax.bar(x, profit_values, width=0.3, color='lightgreen', label='SL Profit Potential', alpha=0.8)
+    
+    # Plot current unrealized PnL
+    pnl_bars = ax.bar(x, pnls, width=0.2, color='green', label='Current Unrealized PnL')
 
-    for i, (bar, pnl) in enumerate(zip(bars, pnls)):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"${pnl:.2f}", ha='center', va='bottom', fontsize=7)
+    # Add value labels positioned beside bars to avoid overlap
+    for i, pnl in enumerate(pnls):
+        # Position PnL labels to the right of bars
+        ax.text(x[i] + 0.1, pnl, f"${pnl:.2f}", ha='left', va='center', fontsize=7, fontweight='bold', color='darkgreen')
+    
     for i, loss in enumerate(max_losses):
         if loss != 0:
-            ax.text(x[i], loss, f"-${abs(loss):.2f}", ha='center', va='top', fontsize=7, color='grey')
+            # Position loss labels to the left of bars
+            ax.text(x[i] - 0.1, loss, f"-${abs(loss):.2f}", ha='right', va='center', fontsize=7, color='grey')
+    
+    for i, profit in enumerate(profit_values):
+        if profit > 0:
+            # Position profit labels to the right of bars
+            ax.text(x[i] + 0.1, profit, f"+${profit:.2f}", ha='left', va='center', fontsize=7, color='green', fontweight='bold')
 
     ax.set_xticks(x)
     ax.set_xticklabels(symbols, rotation=45, ha='right', fontsize=7)
     ax.set_ylabel("PnL (USDT)")
-    ax.set_title("Unrealized PnL vs SL Risk", fontsize=9)
+    ax.set_title("Unrealized PnL vs Next SL to Trigger", fontsize=9)
     ax.legend(fontsize=7)
+    ax.axhline(y=0, color='black', linestyle='-', alpha=0.3)  # Zero line
+    
+    # Set y-axis limits to reduce white space
+    all_values = pnls + max_losses + profit_values
+    if all_values:
+        y_min = min(all_values)
+        y_max = max(all_values)
+        # Add small padding (10% of the range)
+        y_range = y_max - y_min
+        padding = y_range * 0.1 if y_range > 0 else max(abs(y_min), abs(y_max)) * 0.1
+        if padding == 0:
+            padding = 10  # Minimum padding for very small values
+        ax.set_ylim(y_min - padding, y_max + padding)
+    
     plt.tight_layout()
     return fig
 
@@ -193,26 +357,167 @@ def analyze_futures_account():
             (orders['type'] != 'TRAILING_STOP_MARKET')
         ]
 
+        # Process regular stop loss orders
         for _, sl in sl_orders.iterrows():
             if pd.notna(sl['stopPrice']):
-                loss = abs(entry - sl['stopPrice']) * sl['origQty']
-                if side == 'LONG' and sl['stopPrice'] >= entry:
-                    loss_value = -loss
-                elif side == 'SHORT' and sl['stopPrice'] <= entry:
-                    loss_value = -loss
+                # Calculate loss correctly for regular stops
+                if side == 'LONG':
+                    loss = (entry - sl['stopPrice']) * sl['origQty']
+                    loss_value = max(0, loss)  # Ensure positive loss
                 else:
-                    loss_value = loss
+                    loss = (sl['stopPrice'] - entry) * sl['origQty']
+                    loss_value = max(0, loss)  # Ensure positive loss
+                
                 sl_orders_list.append({
                     'type': sl['type'],
                     'stopPrice': sl['stopPrice'],
-                    'loss': loss_value
+                    'loss': loss_value,
+                    'profit': 0,
+                    'qty': sl['origQty']
                 })
-                if abs(loss_value) > abs(coin_max_loss):
+                if loss_value > coin_max_loss:
                     coin_max_loss = loss_value
 
-        # Only add positive losses to the net total (avoid double counting negatives)
-        if coin_max_loss > 0:
-            net_max_loss_from_stops += coin_max_loss
+        # Process trailing stop loss orders
+        trailing_sl_orders = orders[orders['type'] == 'TRAILING_STOP_MARKET']
+        for _, tsl in trailing_sl_orders.iterrows():
+            if pd.notna(tsl['priceRate']) and pd.notna(tsl['origQty']):
+                delta_percent = tsl['priceRate']
+                activate_price = tsl['activatePrice']
+                stop_price_from_api = tsl['stopPrice']
+                
+                # Determine if trailing stop is active
+                if side == 'LONG':
+                    activation_condition_met = pd.isna(activate_price) or mark >= activate_price
+                else:
+                    activation_condition_met = pd.isna(activate_price) or mark <= activate_price
+                
+                if activation_condition_met:
+                    # Trailing stop is active - calculate current trailing price
+                    if side == 'LONG':
+                        effective_sl_price = mark * (1 - delta_percent / 100)
+                    else:
+                        effective_sl_price = mark * (1 + delta_percent / 100)
+                    
+                    # Calculate loss/profit correctly for trailing stops
+                    # For trailing stops, calculate P&L from entry to current trailing price
+                    if side == 'LONG':
+                        # LONG: calculate P&L when price drops to trailing SL
+                        pnl_from_entry = (effective_sl_price - entry) * tsl['origQty']
+                    else:
+                        # SHORT: calculate P&L when price rises to trailing SL  
+                        pnl_from_entry = (entry - effective_sl_price) * tsl['origQty']
+                    
+                    # Determine if it's profit, break-even, or loss
+                    if pnl_from_entry > 0:
+                        # Profit scenario
+                        sl_orders_list.append({
+                            'type': 'TRAILING_STOP_MARKET (ACTIVE)',
+                            'stopPrice': effective_sl_price,
+                            'loss': 0,
+                            'profit': pnl_from_entry,
+                            'qty': tsl['origQty'],
+                            'trail_percent': delta_percent
+                        })
+                    elif pnl_from_entry == 0:
+                        # Break-even scenario
+                        sl_orders_list.append({
+                            'type': 'TRAILING_STOP_MARKET (ACTIVE)',
+                            'stopPrice': effective_sl_price,
+                            'loss': 0,
+                            'profit': 0,
+                            'qty': tsl['origQty'],
+                            'trail_percent': delta_percent
+                        })
+                    else:
+                        # Loss scenario
+                        loss_from_entry = abs(pnl_from_entry)
+                        sl_orders_list.append({
+                            'type': 'TRAILING_STOP_MARKET (ACTIVE)',
+                            'stopPrice': effective_sl_price,
+                            'loss': loss_from_entry,
+                            'profit': 0,
+                            'qty': tsl['origQty'],
+                            'trail_percent': delta_percent
+                        })
+                        
+                        if loss_from_entry > coin_max_loss:
+                            coin_max_loss = loss_from_entry
+                        
+                else:
+                    # Trailing stop not yet active
+                    if pd.notna(stop_price_from_api) and stop_price_from_api != 0:
+                        # Use the current stop price from API
+                        if side == 'LONG':
+                            loss_from_entry = (entry - stop_price_from_api) * tsl['origQty']
+                            loss_from_entry = max(0, loss_from_entry)
+                        else:
+                            loss_from_entry = (stop_price_from_api - entry) * tsl['origQty']
+                            loss_from_entry = max(0, loss_from_entry)
+                        
+                        sl_orders_list.append({
+                            'type': 'TRAILING_STOP_MARKET (INACTIVE)',
+                            'stopPrice': stop_price_from_api,
+                            'loss': loss_from_entry,
+                            'profit': 0,
+                            'qty': tsl['origQty'],
+                            'trail_percent': delta_percent,
+                            'activate_at': activate_price
+                        })
+                        
+                        if loss_from_entry > coin_max_loss:
+                            coin_max_loss = loss_from_entry
+
+        # Calculate which SL will actually trigger first (for net loss calculation)
+        actual_trigger_loss = 0
+        actual_trigger_profit = 0
+        
+        if sl_orders_list:
+            current_price = mark
+            closest_sl = None
+            closest_distance = float('inf')
+            
+            # Filter out conflicting orders for net calculation
+            has_active_trailing = any('trail_percent' in sl and 'ACTIVE' in sl['type'] for sl in sl_orders_list)
+            valid_orders = []
+            conflicting_orders = []
+            
+            for sl in sl_orders_list:
+                if 'trail_percent' in sl:
+                    valid_orders.append(sl)  # Always include trailing stops
+                elif not has_active_trailing:
+                    valid_orders.append(sl)  # Only include regular stops if no active trailing
+                else:
+                    conflicting_orders.append(sl)  # Mark regular stops as conflicting
+            
+            for sl in valid_orders:
+                # Calculate distance considering direction
+                if side == 'LONG':
+                    # For LONG positions, SL triggers when price goes down
+                    if sl['stopPrice'] < current_price:
+                        distance = current_price - sl['stopPrice']
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_sl = sl
+                else:
+                    # For SHORT positions, SL triggers when price goes up
+                    if sl['stopPrice'] > current_price:
+                        distance = sl['stopPrice'] - current_price
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_sl = sl
+            
+            # Use the loss/profit from the closest SL that can actually trigger
+            if closest_sl:
+                actual_trigger_loss = closest_sl.get('loss', 0)
+                actual_trigger_profit = closest_sl.get('profit', 0)
+            else:
+                # Fallback to worst case if no directional SL found
+                actual_trigger_loss = coin_max_loss
+
+        # Add the actual trigger loss to net total
+        if actual_trigger_loss > 0:
+            net_max_loss_from_stops += actual_trigger_loss
 
         tp_orders = orders[orders['type'].isin(['TAKE_PROFIT', 'TAKE_PROFIT_LIMIT', 'TAKE_PROFIT_MARKET'])]
         max_profit = 0
@@ -261,14 +566,68 @@ if coins:  # Only show if we have data
             - Entry Price: ${coin['entry_price']:.4f}, Mark Price: ${coin['mark_price']:.4f}
             - Unrealized PnL: {'+' if coin['unrealized_pnl'] >= 0 else '-'}${abs(coin['unrealized_pnl']):,.2f}
             """)
+            
+            # Check for conflicting orders
+            has_active_trailing = any('trail_percent' in sl and 'ACTIVE' in sl['type'] for sl in coin['sl_orders'])
+            conflicting_orders = []
+            
+            if has_active_trailing:
+                conflicting_orders = [sl for sl in coin['sl_orders'] if 'trail_percent' not in sl]
+                if conflicting_orders:
+                    st.warning(f"⚠️ **CONFLICTING ORDERS DETECTED:** You have {len(conflicting_orders)} regular stop loss order(s) that conflict with your active trailing stop. Consider canceling these regular stop losses:")
+                    for sl in conflicting_orders:
+                        st.markdown(f"   - ❌ {sl['type']} @ ${sl['stopPrice']:.4f} → **CANCEL THIS ORDER**")
+            
             if coin['sl_orders']:
-                st.markdown("**🛑 FIXED STOP LOSS ORDERS:**")
+                st.markdown("**🛑 STOP LOSS ORDERS:**")
                 for sl in coin['sl_orders']:
-                    sign = '+' if sl['loss'] < 0 else '-'
-                    st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} → {sign}${abs(sl['loss']):.2f}")
+                    # Skip conflicting orders in main display (they're shown in warning above)
+                    if sl in conflicting_orders:
+                        continue
+                        
+                    # Handle different display for losses vs profits/break-even
+                    if 'trail_percent' in sl:
+                        # Trailing stop loss
+                        if 'ACTIVE' in sl['type']:
+                            if sl.get('profit', 0) > 0:
+                                st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%) → **+${sl['profit']:.2f} Profit** 🎯")
+                            elif sl['loss'] == 0:
+                                st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%) → **$0.00 Break-even**")
+                            else:
+                                st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%) → -${sl['loss']:.2f}")
+                        else:
+                            st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} (Trail: {sl['trail_percent']:.2f}%, Activates @ ${sl.get('activate_at', 'N/A')}) → -${sl['loss']:.2f}")
+                    else:
+                        # Regular stop loss
+                        st.markdown(f"- {sl['type']} @ ${sl['stopPrice']:.4f} → -${sl['loss']:.2f}")
+                
+                # Show which SL will trigger first (excluding conflicting orders)
+                valid_sl_orders = [sl for sl in coin['sl_orders'] if sl not in conflicting_orders]
+                if len(valid_sl_orders) > 1:
+                    closest_sl = None
+                    closest_distance = float('inf')
+                    current_price = coin['mark_price']
+                    
+                    for sl in valid_sl_orders:
+                        distance = abs(current_price - sl['stopPrice'])
+                        if distance < closest_distance:
+                            closest_distance = distance
+                            closest_sl = sl
+                    
+                    if closest_sl:
+                        st.info(f"⚡ **Closest to trigger:** {closest_sl['type']} @ ${closest_sl['stopPrice']:.4f} (Distance: ${closest_distance:.4f})")
+                
                 st.pyplot(draw_loss_chart(coin['sl_orders'], coin['symbol']))
             else:
-                st.warning(f"⚠️ No SL found for {abs(coin['position_amt'])} units. Risk is undefined.")
+                # Calculate uncovered quantity
+                total_sl_qty = sum(sl.get('qty', 0) for sl in coin['sl_orders'])
+                uncovered_qty = abs(coin['position_amt']) - total_sl_qty
+                
+                if uncovered_qty > 0:
+                    uncovered_value = uncovered_qty * coin['mark_price']
+                    st.warning(f"⚠️ No SL for {uncovered_qty:.4f} units (~${uncovered_value:,.0f}). Risk is undefined.")
+                else:
+                    st.warning(f"⚠️ No stop loss orders found for {abs(coin['position_amt']):.4f} units. Risk is undefined.")
 
 # Auto-refresh with delay
 time.sleep(2)
